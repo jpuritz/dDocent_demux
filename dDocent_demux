@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Demultiplex Illumina sequences based on paired indices with mismatch tolerance
+Demultiplex Illumina sequences based on paired indices and/or inline barcodes with mismatch tolerance
 """
 
 import gzip
@@ -51,29 +51,136 @@ def parse_indices_from_header(header):
                 return index_pair[0], index_pair[1]
     return None, None
 
-def find_best_match(observed_i7, observed_i5, expected_pairs, max_mismatches):
-    """Find best matching index pair with mismatch tolerance"""
+def parse_sample_file(sample_file):
+    """
+    Parse sample file and auto-detect format
+    Returns: (expected_combos, demux_mode, barcode_lengths)
+    """
+    expected_combos = {}
+    
+    with open(sample_file) as f:
+        header = f.readline().strip()
+        
+        # Try tab delimiter first, then space
+        if '\t' in header:
+            header_parts = header.split('\t')
+            delimiter = '\t'
+        else:
+            header_parts = header.split()
+            delimiter = None
+        
+        header_lower = [h.lower() for h in header_parts]
+        
+        # Detect columns
+        has_i7 = 'i7' in header_lower
+        has_i5 = 'i5' in header_lower
+        has_barcode_r1 = any(x in header_lower for x in ['barcode_r1', 'bc_r1', 'barcode_f', 'bc_f'])
+        has_barcode_r2 = any(x in header_lower for x in ['barcode_r2', 'bc_r2', 'barcode_r', 'bc_r'])
+        
+        # Determine column indices
+        sample_idx = 0
+        i7_idx = header_lower.index('i7') if has_i7 else None
+        i5_idx = header_lower.index('i5') if has_i5 else None
+        
+        bc_r1_idx = None
+        bc_r2_idx = None
+        for idx, col in enumerate(header_lower):
+            if col in ['barcode_r1', 'bc_r1', 'barcode_f', 'bc_f']:
+                bc_r1_idx = idx
+            if col in ['barcode_r2', 'bc_r2', 'barcode_r', 'bc_r']:
+                bc_r2_idx = idx
+        
+        # Determine demultiplexing mode
+        if has_i7 and has_i5 and has_barcode_r1 and has_barcode_r2:
+            demux_mode = "both"
+        elif has_i7 and has_i5:
+            demux_mode = "indices"
+        elif has_barcode_r1 and has_barcode_r2:
+            demux_mode = "barcodes"
+        else:
+            raise ValueError("Could not detect valid demultiplexing format. File must have either (i7, i5) or (Barcode_R1, Barcode_R2) or all four columns.")
+        
+        barcode_lengths = (0, 0)
+        
+        # Parse data lines
+        line_num = 1
+        for line in f:
+            line_num += 1
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Use same delimiter as header
+            if delimiter:
+                parts = line.split(delimiter)
+            else:
+                parts = line.split()
+            
+            # Validate line has enough columns
+            max_idx = max([idx for idx in [sample_idx, i7_idx, i5_idx, bc_r1_idx, bc_r2_idx] if idx is not None])
+            if len(parts) <= max_idx:
+                raise ValueError(f"Line {line_num} has {len(parts)} columns but expected at least {max_idx + 1}. Line: {line}")
+            
+            sample = parts[sample_idx].strip()
+            
+            i7 = parts[i7_idx].strip() if i7_idx is not None and len(parts) > i7_idx else None
+            i5 = parts[i5_idx].strip() if i5_idx is not None and len(parts) > i5_idx else None
+            bc_r1 = parts[bc_r1_idx].strip() if bc_r1_idx is not None and len(parts) > bc_r1_idx else None
+            bc_r2 = parts[bc_r2_idx].strip() if bc_r2_idx is not None and len(parts) > bc_r2_idx else None
+            
+            if bc_r1 and bc_r2:
+                barcode_lengths = (len(bc_r1), len(bc_r2))
+            
+            expected_combos[sample] = (i7, i5, bc_r1, bc_r2)
+    
+    return expected_combos, demux_mode, barcode_lengths
+
+def find_best_match(observed_i7, observed_i5, r1_seq, r2_seq, expected_combos, barcode_lengths, max_mismatches):
+    """
+    Find best matching sample based on header indices and/or inline barcodes
+    Checks inline barcodes at position 0 and position 1 (offset)
+    Returns (sample_name, total_mismatches, barcode_offset) or (None, None, None)
+    """
     best_match = None
     best_distance = float('inf')
+    best_offset = 0
     matches = []
     
-    for sample_name, (exp_i7, exp_i5) in expected_pairs.items():
-        dist_i7 = hamming_distance(observed_i7, exp_i7)
-        dist_i5 = hamming_distance(observed_i5, exp_i5)
-        total_dist = dist_i7 + dist_i5
+    # Try both offset positions for inline barcodes (0 and 1)
+    for offset in [0, 1]:
+        obs_bc_r1 = r1_seq[offset:offset+barcode_lengths[0]] if barcode_lengths[0] > 0 and len(r1_seq) >= offset+barcode_lengths[0] else None
+        obs_bc_r2 = r2_seq[offset:offset+barcode_lengths[1]] if barcode_lengths[1] > 0 and len(r2_seq) >= offset+barcode_lengths[1] else None
         
-        if total_dist <= max_mismatches:
-            if total_dist < best_distance:
-                best_match = sample_name
-                best_distance = total_dist
-                matches = [sample_name]
-            elif total_dist == best_distance:
-                matches.append(sample_name)
+        for sample_name, (exp_i7, exp_i5, exp_bc_r1, exp_bc_r2) in expected_combos.items():
+            total_dist = 0
+            
+            # Compare header indices if provided
+            if exp_i7 and observed_i7:
+                total_dist += hamming_distance(observed_i7, exp_i7)
+            if exp_i5 and observed_i5:
+                total_dist += hamming_distance(observed_i5, exp_i5)
+            
+            # Compare inline barcodes if provided
+            if exp_bc_r1 and obs_bc_r1:
+                total_dist += hamming_distance(obs_bc_r1, exp_bc_r1)
+            if exp_bc_r2 and obs_bc_r2:
+                total_dist += hamming_distance(obs_bc_r2, exp_bc_r2)
+            
+            if total_dist <= max_mismatches:
+                if total_dist < best_distance:
+                    best_match = sample_name
+                    best_distance = total_dist
+                    best_offset = offset
+                    matches = [(sample_name, offset)]
+                elif total_dist == best_distance:
+                    matches.append((sample_name, offset))
     
-    if len(matches) > 1:
-        return None, None
+    # Check for ambiguous matches (same sample at different offsets is OK)
+    unique_samples = set([m[0] for m in matches])
+    if len(unique_samples) > 1:
+        return None, None, None
     
-    return best_match, best_distance if best_match else (None, None)
+    return best_match, best_distance if best_match else None, best_offset
 
 def format_time(seconds):
     """Format seconds into human readable time"""
@@ -86,38 +193,97 @@ def format_time(seconds):
         hours = seconds / 3600
         return f"{hours:.1f}h"
 
-def demultiplex(r1_file, r2_file, index_file, output_prefix, max_mismatches=1, discard_undetermined=False):
+def check_first_reads(r1_file, r2_file, expected_combos, barcode_lengths, demux_mode, num_reads=100):
+    """Check first N reads and show what indices/barcodes are observed"""
+    print(f"DEBUG MODE: Checking first {num_reads} reads")
+    print("-" * 80)
+    
+    r1_open = gzip.open(r1_file, 'rt') if r1_file.endswith('.gz') else open(r1_file)
+    r2_open = gzip.open(r2_file, 'rt') if r2_file.endswith('.gz') else open(r2_file)
+    
+    for i in range(num_reads):
+        r1_lines = [r1_open.readline() for _ in range(4)]
+        r2_lines = [r2_open.readline() for _ in range(4)]
+        
+        if not r1_lines[0]:
+            break
+        
+        obs_i7, obs_i5 = parse_indices_from_header(r1_lines[0])
+        
+        print(f"Read {i+1}:")
+        
+        # Show header indices only if in indices or both mode
+        if demux_mode in ['indices', 'both'] and obs_i7 and obs_i5:
+            print(f"  Header indices: {obs_i7}+{obs_i5}")
+        
+        # Show barcodes only if in barcodes or both mode
+        if demux_mode in ['barcodes', 'both'] and barcode_lengths[0] > 0:
+            obs_bc_r1_pos0 = r1_lines[1][:barcode_lengths[0]].strip()
+            obs_bc_r2_pos0 = r2_lines[1][:barcode_lengths[1]].strip()
+            print(f"  Inline barcodes (pos 0): {obs_bc_r1_pos0}+{obs_bc_r2_pos0}")
+            
+            if len(r1_lines[1]) > barcode_lengths[0] and len(r2_lines[1]) > barcode_lengths[1]:
+                obs_bc_r1_pos1 = r1_lines[1][1:1+barcode_lengths[0]].strip()
+                obs_bc_r2_pos1 = r2_lines[1][1:1+barcode_lengths[1]].strip()
+                print(f"  Inline barcodes (pos 1): {obs_bc_r1_pos1}+{obs_bc_r2_pos1}")
+        
+        # Find closest match
+        best_sample, best_dist, best_offset = find_best_match(obs_i7, obs_i5, r1_lines[1], r2_lines[1], 
+                                                               expected_combos, barcode_lengths, 999)
+        
+        if best_sample:
+            if demux_mode == 'barcodes':
+                print(f"  Closest match: {best_sample} (distance: {best_dist}, offset: {best_offset})")
+            else:
+                print(f"  Closest match: {best_sample} (distance: {best_dist})")
+        else:
+            print(f"  No close match found")
+        print()
+    
+    r1_open.close()
+    r2_open.close()
+    print("-" * 80)
+    print()
+
+def demultiplex(r1_file, r2_file, sample_file, output_prefix, max_mismatches=1, 
+                discard_undetermined=False, trim_barcodes=True, debug=False):
     """Demultiplex paired-end reads"""
     
-    # Parse expected index pairs
-    expected_pairs = {}
-    with open(index_file) as f:
-        next(f)  # Skip header
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            
-            parts = line.split('\t') if '\t' in line else line.split()
-            if len(parts) >= 3:
-                sample, i7, i5 = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                expected_pairs[sample] = (i7, i5)
+    # Parse sample file and auto-detect format
+    expected_combos, demux_mode, barcode_lengths = parse_sample_file(sample_file)
     
-    print(f"Loaded {len(expected_pairs)} sample index pairs")
-    print("\nSample index combinations:")
-    for sample, (i7, i5) in sorted(expected_pairs.items()):
-        print(f"  {sample:20s}: i7={i7}  i5={i5}")
+    print(f"Detected demultiplexing mode: {demux_mode}")
+    print(f"Loaded {len(expected_combos)} sample combinations")
+    print("\nSample combinations:")
+    for sample, (i7, i5, bc_r1, bc_r2) in sorted(expected_combos.items()):
+        parts = []
+        if demux_mode in ['indices', 'both'] and i7 and i5:
+            parts.append(f"i7={i7} i5={i5}")
+        if demux_mode in ['barcodes', 'both'] and bc_r1 and bc_r2:
+            parts.append(f"BC_R1={bc_r1} BC_R2={bc_r2}")
+        print(f"  {sample:20s}: {' | '.join(parts)}")
     print()
+    
+    if demux_mode in ['barcodes', 'both']:
+        print(f"Inline barcodes: checking at position 0 and position 1 (offset)")
+        if trim_barcodes:
+            print(f"Inline barcodes will be trimmed from output (R1: {barcode_lengths[0]}bp, R2: {barcode_lengths[1]}bp)")
+        else:
+            print("Inline barcodes will NOT be trimmed from output")
+    
+    # Check first reads for diagnostics (only in debug mode)
+    if debug:
+        check_first_reads(r1_file, r2_file, expected_combos, barcode_lengths, demux_mode, 100)
     
     # Open output files
     output_handles = {}
-    for sample in expected_pairs:
+    for sample in expected_combos:
         output_handles[sample] = {
             'r1': gzip.open(f'{sample}.F.fastq.gz', 'wt'),
             'r2': gzip.open(f'{sample}.R.fastq.gz', 'wt')
         }
     
-    # Undetermined reads (only if not discarding)
+    # Undetermined reads
     if not discard_undetermined:
         output_handles['undetermined'] = {
             'r1': gzip.open(f'{output_prefix}_undetermined.F.fastq.gz', 'wt'),
@@ -129,7 +295,8 @@ def demultiplex(r1_file, r2_file, index_file, output_prefix, max_mismatches=1, d
     
     # Statistics
     stats = defaultdict(int)
-    unmatched_indices = defaultdict(int)
+    offset_stats = defaultdict(int)
+    unmatched_combos = defaultdict(int)
     total_reads = 0
     start_time = time.time()
     
@@ -148,31 +315,50 @@ def demultiplex(r1_file, r2_file, index_file, output_prefix, max_mismatches=1, d
             break
         
         total_reads += 1
+        
+        # Extract header indices
         obs_i7, obs_i5 = parse_indices_from_header(r1_lines[0])
         
-        if obs_i7 and obs_i5:
-            sample, mismatches = find_best_match(obs_i7, obs_i5, expected_pairs, max_mismatches)
+        # Find best match (checks both offset positions internally)
+        sample, mismatches, offset = find_best_match(obs_i7, obs_i5, r1_lines[1], r2_lines[1],
+                                                     expected_combos, barcode_lengths, max_mismatches)
+        
+        if sample:
+            # Write matched reads
+            output_r1 = list(r1_lines)
+            output_r2 = list(r2_lines)
             
-            if sample:
-                output_handles[sample]['r1'].writelines(r1_lines)
-                output_handles[sample]['r2'].writelines(r2_lines)
-                stats[sample] += 1
-            else:
-                # Track unmatched index pairs
-                index_pair = f"{obs_i7}+{obs_i5}"
-                unmatched_indices[index_pair] += 1
-                
-                if not discard_undetermined:
-                    output_handles['undetermined']['r1'].writelines(r1_lines)
-                    output_handles['undetermined']['r2'].writelines(r2_lines)
-                stats['undetermined'] += 1
+            # Trim barcodes if requested (accounting for offset)
+            if trim_barcodes and barcode_lengths[0] > 0:
+                trim_pos_r1 = offset + barcode_lengths[0]
+                trim_pos_r2 = offset + barcode_lengths[1]
+                output_r1[1] = r1_lines[1][trim_pos_r1:]
+                output_r1[3] = r1_lines[3][trim_pos_r1:]
+                output_r2[1] = r2_lines[1][trim_pos_r2:]
+                output_r2[3] = r2_lines[3][trim_pos_r2:]
+            
+            output_handles[sample]['r1'].writelines(output_r1)
+            output_handles[sample]['r2'].writelines(output_r2)
+            stats[sample] += 1
+            offset_stats[offset] += 1
         else:
+            # Track unmatched combinations (mode-aware)
+            combo_parts = []
+            if demux_mode in ['indices', 'both'] and obs_i7 and obs_i5:
+                combo_parts.append(f"{obs_i7}+{obs_i5}")
+            if demux_mode in ['barcodes', 'both'] and barcode_lengths[0] > 0:
+                obs_bc_r1 = r1_lines[1][:barcode_lengths[0]].strip()
+                obs_bc_r2 = r2_lines[1][:barcode_lengths[1]].strip()
+                combo_parts.append(f"{obs_bc_r1}+{obs_bc_r2}")
+            combo_str = "|".join(combo_parts) if combo_parts else "unknown"
+            unmatched_combos[combo_str] += 1
+            
             if not discard_undetermined:
                 output_handles['undetermined']['r1'].writelines(r1_lines)
                 output_handles['undetermined']['r2'].writelines(r2_lines)
             stats['undetermined'] += 1
         
-        # Progress update every 100k reads
+        # Progress update
         if total_reads % 100000 == 0:
             elapsed = time.time() - start_time
             rate = total_reads / elapsed
@@ -197,29 +383,49 @@ def demultiplex(r1_file, r2_file, index_file, output_prefix, max_mismatches=1, d
     print(f"Total reads processed: {total_reads:,}")
     print(f"Total time: {format_time(total_time)}")
     print(f"Average rate: {final_rate:,.0f} reads/sec")
+    
+    # Print offset statistics if barcodes were used
+    if demux_mode in ['barcodes', 'both'] and offset_stats:
+        print(f"\nBarcode offset statistics:")
+        for offset in sorted(offset_stats.keys()):
+            count = offset_stats[offset]
+            pct = 100 * count / sum(offset_stats.values())
+            print(f"  Position {offset}: {count:,} reads ({pct:.2f}%)")
+    
     print(f"\nPer-sample counts:")
     for sample, count in sorted(stats.items()):
         pct = 100 * count / total_reads if total_reads > 0 else 0
         print(f"  {sample:20s}: {count:10,} ({pct:6.2f}%)")
     
-    # Print top 10 unmatched index pairs
-    if unmatched_indices:
+    # Print top 10 unmatched combinations
+    if unmatched_combos:
         print(f"\n{'='*50}")
-        print(f"Top 10 Non-Matched Index Pairs")
+        print(f"Top 10 Non-Matched Combinations")
         print(f"{'='*50}")
-        top_unmatched = sorted(unmatched_indices.items(), key=lambda x: x[1], reverse=True)[:10]
-        for index_pair, count in top_unmatched:
+        top_unmatched = sorted(unmatched_combos.items(), key=lambda x: x[1], reverse=True)[:10]
+        for combo, count in top_unmatched:
             pct = 100 * count / stats['undetermined'] if stats['undetermined'] > 0 else 0
-            print(f"  {index_pair:25s}: {count:10,} ({pct:6.2f}% of undetermined)")
+            print(f"  {combo:40s}: {count:10,} ({pct:6.2f}% of undetermined)")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Demultiplex Illumina paired-end reads')
+    parser = argparse.ArgumentParser(
+        description='Demultiplex Illumina paired-end reads by header indices and/or inline barcodes',
+        epilog="""
+Sample file format (tab-delimited, auto-detected):
+  - Header indices only:    Sample  i7  i5
+  - Inline barcodes only:   Sample  Barcode_R1  Barcode_R2
+  - Both:                   Sample  i7  i5  Barcode_R1  Barcode_R2
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument('-r1', '--read1', required=True, help='R1 FASTQ file')
     parser.add_argument('-r2', '--read2', required=True, help='R2 FASTQ file')
-    parser.add_argument('-i', '--index', required=True, help='Index file (tab-delimited: sample, i7, i5)')
-    parser.add_argument('-o', '--output', required=True, help='Output prefix (used for undetermined reads only)')
-    parser.add_argument('-m', '--mismatches', type=int, default=1, help='Maximum mismatches (default: 1)')
+    parser.add_argument('-s', '--samples', required=True, help='Sample file with indices/barcodes (auto-detects format)')
+    parser.add_argument('-o', '--output', required=True, help='Output prefix (used for undetermined reads and log)')
+    parser.add_argument('-m', '--mismatches', type=int, default=1, help='Maximum mismatches across all indices/barcodes (default: 1)')
+    parser.add_argument('--no-trim', action='store_true', help='Do not trim inline barcodes from output sequences')
     parser.add_argument('--discard-undetermined', action='store_true', help='Discard undetermined reads instead of saving them')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode to check first 100 reads')
     
     args = parser.parse_args()
     
@@ -237,11 +443,16 @@ if __name__ == '__main__':
     print()
     
     # Run demultiplexing
-    demultiplex(args.read1, args.read2, args.index, args.output, args.mismatches, args.discard_undetermined)
-    
-    # Print completion
-    print()
-    print(f"\nDemultiplexing completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Close logger
-    logger.close()
+    try:
+        demultiplex(args.read1, args.read2, args.samples, args.output, 
+                    args.mismatches, args.discard_undetermined, not args.no_trim, args.debug)
+        
+        # Print completion
+        print()
+        print(f"\nDemultiplexing completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as e:
+        print(f"\nERROR: {str(e)}")
+        raise
+    finally:
+        # Close logger
+        logger.close()
