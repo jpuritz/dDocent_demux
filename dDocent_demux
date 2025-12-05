@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""
+Demultiplex Illumina sequences based on paired indices with mismatch tolerance
+"""
+
+import gzip
+import argparse
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+
+class Logger:
+    """Logger that writes to both stdout and a log file"""
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, 'w')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        if not self.log.closed:
+            self.log.write(message)
+    
+    def flush(self):
+        self.terminal.flush()
+        if not self.log.closed:
+            self.log.flush()
+    
+    def close(self):
+        if not self.log.closed:
+            self.log.close()
+
+def hamming_distance(s1, s2):
+    """Calculate Hamming distance between two sequences"""
+    if len(s1) != len(s2):
+        return float('inf')
+    return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+
+def parse_indices_from_header(header):
+    """
+    Extract i5 and i7 indices from Illumina header
+    Format: @INSTRUMENT:RUN:FLOWCELL:LANE:TILE:X:Y READ:FILTERED:CONTROL:INDEX1+INDEX2
+    Note: Some instruments output i5+i7 order
+    """
+    parts = header.strip().split()
+    if len(parts) >= 2:
+        index_section = parts[1].split(':')
+        if len(index_section) >= 4:
+            index_pair = index_section[3].split('+')
+            if len(index_pair) == 2:
+                return index_pair[0], index_pair[1]
+    return None, None
+
+def find_best_match(observed_i7, observed_i5, expected_pairs, max_mismatches):
+    """Find best matching index pair with mismatch tolerance"""
+    best_match = None
+    best_distance = float('inf')
+    matches = []
+    
+    for sample_name, (exp_i7, exp_i5) in expected_pairs.items():
+        dist_i7 = hamming_distance(observed_i7, exp_i7)
+        dist_i5 = hamming_distance(observed_i5, exp_i5)
+        total_dist = dist_i7 + dist_i5
+        
+        if total_dist <= max_mismatches:
+            if total_dist < best_distance:
+                best_match = sample_name
+                best_distance = total_dist
+                matches = [sample_name]
+            elif total_dist == best_distance:
+                matches.append(sample_name)
+    
+    if len(matches) > 1:
+        return None, None
+    
+    return best_match, best_distance if best_match else (None, None)
+
+def format_time(seconds):
+    """Format seconds into human readable time"""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        mins = seconds / 60
+        return f"{mins:.1f}m"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.1f}h"
+
+def demultiplex(r1_file, r2_file, index_file, output_prefix, max_mismatches=1, discard_undetermined=False):
+    """Demultiplex paired-end reads"""
+    
+    # Parse expected index pairs
+    expected_pairs = {}
+    with open(index_file) as f:
+        next(f)  # Skip header
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split('\t') if '\t' in line else line.split()
+            if len(parts) >= 3:
+                sample, i7, i5 = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                expected_pairs[sample] = (i7, i5)
+    
+    print(f"Loaded {len(expected_pairs)} sample index pairs")
+    print("\nSample index combinations:")
+    for sample, (i7, i5) in sorted(expected_pairs.items()):
+        print(f"  {sample:20s}: i7={i7}  i5={i5}")
+    print()
+    
+    # Open output files
+    output_handles = {}
+    for sample in expected_pairs:
+        output_handles[sample] = {
+            'r1': gzip.open(f'{sample}.F.fastq.gz', 'wt'),
+            'r2': gzip.open(f'{sample}.R.fastq.gz', 'wt')
+        }
+    
+    # Undetermined reads (only if not discarding)
+    if not discard_undetermined:
+        output_handles['undetermined'] = {
+            'r1': gzip.open(f'{output_prefix}_undetermined.F.fastq.gz', 'wt'),
+            'r2': gzip.open(f'{output_prefix}_undetermined.R.fastq.gz', 'wt')
+        }
+        print("Undetermined reads will be saved")
+    else:
+        print("Undetermined reads will be discarded")
+    
+    # Statistics
+    stats = defaultdict(int)
+    unmatched_indices = defaultdict(int)
+    total_reads = 0
+    start_time = time.time()
+    
+    # Process reads
+    r1_open = gzip.open(r1_file, 'rt') if r1_file.endswith('.gz') else open(r1_file)
+    r2_open = gzip.open(r2_file, 'rt') if r2_file.endswith('.gz') else open(r2_file)
+    
+    print("\nProcessing reads...")
+    print("-" * 50)
+    
+    while True:
+        r1_lines = [r1_open.readline() for _ in range(4)]
+        r2_lines = [r2_open.readline() for _ in range(4)]
+        
+        if not r1_lines[0]:
+            break
+        
+        total_reads += 1
+        obs_i7, obs_i5 = parse_indices_from_header(r1_lines[0])
+        
+        if obs_i7 and obs_i5:
+            sample, mismatches = find_best_match(obs_i7, obs_i5, expected_pairs, max_mismatches)
+            
+            if sample:
+                output_handles[sample]['r1'].writelines(r1_lines)
+                output_handles[sample]['r2'].writelines(r2_lines)
+                stats[sample] += 1
+            else:
+                # Track unmatched index pairs
+                index_pair = f"{obs_i7}+{obs_i5}"
+                unmatched_indices[index_pair] += 1
+                
+                if not discard_undetermined:
+                    output_handles['undetermined']['r1'].writelines(r1_lines)
+                    output_handles['undetermined']['r2'].writelines(r2_lines)
+                stats['undetermined'] += 1
+        else:
+            if not discard_undetermined:
+                output_handles['undetermined']['r1'].writelines(r1_lines)
+                output_handles['undetermined']['r2'].writelines(r2_lines)
+            stats['undetermined'] += 1
+        
+        # Progress update every 100k reads
+        if total_reads % 100000 == 0:
+            elapsed = time.time() - start_time
+            rate = total_reads / elapsed
+            print(f"  {total_reads:,} reads processed | {format_time(elapsed)} elapsed | {rate:,.0f} reads/sec")
+    
+    # Close files
+    for sample_handles in output_handles.values():
+        sample_handles['r1'].close()
+        sample_handles['r2'].close()
+    r1_open.close()
+    r2_open.close()
+    
+    # Calculate final timing
+    total_time = time.time() - start_time
+    final_rate = total_reads / total_time if total_time > 0 else 0
+    
+    # Print statistics
+    print("-" * 50)
+    print(f"\n{'='*50}")
+    print(f"Demultiplexing Statistics")
+    print(f"{'='*50}")
+    print(f"Total reads processed: {total_reads:,}")
+    print(f"Total time: {format_time(total_time)}")
+    print(f"Average rate: {final_rate:,.0f} reads/sec")
+    print(f"\nPer-sample counts:")
+    for sample, count in sorted(stats.items()):
+        pct = 100 * count / total_reads if total_reads > 0 else 0
+        print(f"  {sample:20s}: {count:10,} ({pct:6.2f}%)")
+    
+    # Print top 10 unmatched index pairs
+    if unmatched_indices:
+        print(f"\n{'='*50}")
+        print(f"Top 10 Non-Matched Index Pairs")
+        print(f"{'='*50}")
+        top_unmatched = sorted(unmatched_indices.items(), key=lambda x: x[1], reverse=True)[:10]
+        for index_pair, count in top_unmatched:
+            pct = 100 * count / stats['undetermined'] if stats['undetermined'] > 0 else 0
+            print(f"  {index_pair:25s}: {count:10,} ({pct:6.2f}% of undetermined)")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Demultiplex Illumina paired-end reads')
+    parser.add_argument('-r1', '--read1', required=True, help='R1 FASTQ file')
+    parser.add_argument('-r2', '--read2', required=True, help='R2 FASTQ file')
+    parser.add_argument('-i', '--index', required=True, help='Index file (tab-delimited: sample, i7, i5)')
+    parser.add_argument('-o', '--output', required=True, help='Output prefix (used for undetermined reads only)')
+    parser.add_argument('-m', '--mismatches', type=int, default=1, help='Maximum mismatches (default: 1)')
+    parser.add_argument('--discard-undetermined', action='store_true', help='Discard undetermined reads instead of saving them')
+    
+    args = parser.parse_args()
+    
+    # Create log file
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f'{args.output}_demultiplex_{timestamp}.log'
+    logger = Logger(log_filename)
+    sys.stdout = logger
+    
+    # Print command and timestamp
+    print(f"Demultiplexing started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Command: {' '.join(sys.argv)}")
+    print(f"Log file: {log_filename}")
+    print("="*50)
+    print()
+    
+    # Run demultiplexing
+    demultiplex(args.read1, args.read2, args.index, args.output, args.mismatches, args.discard_undetermined)
+    
+    # Print completion
+    print()
+    print(f"\nDemultiplexing completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Close logger
+    logger.close()
