@@ -1,4 +1,5 @@
-# Illumina Demultiplexing Script
+# dDocent_demux
+## Illumina Demultiplexing Script
 
 A flexible Python script for demultiplexing Illumina paired-end sequencing reads based on header indices (i7/i5) and/or inline barcodes with configurable mismatch tolerance.
 
