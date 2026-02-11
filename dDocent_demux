@@ -10,6 +10,9 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
+MISMATCH_ALPHABET = "ACGTNRYMKSWHBVDacgtnrymkswhbvd"
+LOOKUP_MISS = object()
+
 class Logger:
     """Logger that writes to both stdout and a log file"""
     def __init__(self, filename):
@@ -30,11 +33,17 @@ class Logger:
         if not self.log.closed:
             self.log.close()
 
-def hamming_distance(s1, s2):
-    """Calculate Hamming distance between two sequences"""
+def hamming_distance_bounded(s1, s2, max_dist):
+    """Calculate Hamming distance with early exit once max_dist is exceeded"""
     if len(s1) != len(s2):
-        return float('inf')
-    return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+        return max_dist + 1
+    dist = 0
+    for c1, c2 in zip(s1, s2):
+        if c1 != c2:
+            dist += 1
+            if dist > max_dist:
+                return dist
+    return dist
 
 def parse_indices_from_header(header):
     """
@@ -42,13 +51,29 @@ def parse_indices_from_header(header):
     Format: @INSTRUMENT:RUN:FLOWCELL:LANE:TILE:X:Y READ:FILTERED:CONTROL:INDEX1+INDEX2
     Note: Some instruments output i5+i7 order
     """
-    parts = header.strip().split()
-    if len(parts) >= 2:
-        index_section = parts[1].split(':')
-        if len(index_section) >= 4:
-            index_pair = index_section[3].split('+')
-            if len(index_pair) == 2:
-                return index_pair[0], index_pair[1]
+    header = header.rstrip('\n')
+    first_ws = header.find(' ')
+    if first_ws < 0:
+        first_ws = header.find('\t')
+    if first_ws < 0:
+        return None, None
+
+    read_meta = header[first_ws + 1:]
+    next_space = read_meta.find(' ')
+    next_tab = read_meta.find('\t')
+    if next_space < 0 or (0 <= next_tab < next_space):
+        next_space = next_tab
+    if next_space >= 0:
+        read_meta = read_meta[:next_space]
+
+    last_colon = read_meta.rfind(':')
+    if last_colon < 0:
+        return None, None
+
+    index_pair = read_meta[last_colon + 1:]
+    plus_idx = index_pair.find('+')
+    if plus_idx > 0 and plus_idx < len(index_pair) - 1:
+        return index_pair[:plus_idx], index_pair[plus_idx + 1:]
     return None, None
 
 def parse_sample_file(sample_file):
@@ -135,52 +160,207 @@ def parse_sample_file(sample_file):
     
     return expected_combos, demux_mode, barcode_lengths
 
-def find_best_match(observed_i7, observed_i5, r1_seq, r2_seq, expected_combos, barcode_lengths, max_mismatches):
+def _add_lookup_candidate(lookup, key, sample_name, distance, offset):
+    current = lookup.get(key)
+    if current is None or distance < current[0]:
+        lookup[key] = (distance, sample_name, offset, False)
+    elif distance == current[0] and sample_name != current[1]:
+        lookup[key] = (current[0], current[1], current[2], True)
+
+def _iter_one_mismatch_neighbors(fields):
+    for field_idx, field in enumerate(fields):
+        chars = list(field)
+        for char_idx, original in enumerate(chars):
+            for alt in MISMATCH_ALPHABET:
+                if alt == original:
+                    continue
+                mutated_chars = chars.copy()
+                mutated_chars[char_idx] = alt
+                mutated_field = ''.join(mutated_chars)
+                neighbor = list(fields)
+                neighbor[field_idx] = mutated_field
+                yield tuple(neighbor)
+
+def build_fast_lookup(expected_combos, demux_mode, max_mismatches):
     """
-    Find best matching sample based on header indices and/or inline barcodes
-    Checks inline barcodes at position 0 and position 1 (offset)
-    Returns (sample_name, total_mismatches, barcode_offset) or (None, None, None)
+    Build O(1) lookup tables for exact and one-mismatch matching.
+    Falls back to scan-based matcher when max_mismatches > 1 or fields are incomplete.
     """
+    if max_mismatches not in (0, 1):
+        return None
+
+    use_offsets = demux_mode in ('barcodes', 'both')
+    offsets = (0, 1) if use_offsets else (0,)
+    lookup = {}
+
+    for sample_name, (exp_i7, exp_i5, exp_bc_r1, exp_bc_r2) in expected_combos.items():
+        if demux_mode == 'indices':
+            fields = (exp_i7, exp_i5)
+        elif demux_mode == 'barcodes':
+            fields = (exp_bc_r1, exp_bc_r2)
+        else:
+            fields = (exp_i7, exp_i5, exp_bc_r1, exp_bc_r2)
+
+        if any(not field for field in fields):
+            return None
+
+        for offset in offsets:
+            key = (offset,) + fields
+            _add_lookup_candidate(lookup, key, sample_name, 0, offset)
+            if max_mismatches == 1:
+                for neighbor in _iter_one_mismatch_neighbors(fields):
+                    neighbor_key = (offset,) + neighbor
+                    _add_lookup_candidate(lookup, neighbor_key, sample_name, 1, offset)
+
+    return lookup
+
+def _find_best_match_lookup(observed_i7, observed_i5, r1_seq, r2_seq, barcode_lengths, demux_mode, fast_lookup):
+    offsets = (0, 1) if demux_mode in ('barcodes', 'both') else (0,)
+    r1_len = len(r1_seq)
+    r2_len = len(r2_seq)
+
+    best_distance = float('inf')
+    best_sample = None
+    best_offset = 0
+    best_samples = set()
+    ambiguous_at_best = False
+    found_candidate = False
+
+    for offset in offsets:
+        key_fields = []
+
+        if demux_mode in ('indices', 'both'):
+            if not observed_i7 or not observed_i5:
+                continue
+            key_fields.append(observed_i7)
+            key_fields.append(observed_i5)
+
+        if demux_mode in ('barcodes', 'both'):
+            if barcode_lengths[0] > 0:
+                bc_r1_end = offset + barcode_lengths[0]
+                if r1_len < bc_r1_end:
+                    continue
+                key_fields.append(r1_seq[offset:bc_r1_end])
+            if barcode_lengths[1] > 0:
+                bc_r2_end = offset + barcode_lengths[1]
+                if r2_len < bc_r2_end:
+                    continue
+                key_fields.append(r2_seq[offset:bc_r2_end])
+
+        entry = fast_lookup.get((offset,) + tuple(key_fields))
+        if entry is None:
+            continue
+
+        found_candidate = True
+        distance, sample_name, entry_offset, ambiguous = entry
+
+        if distance < best_distance:
+            best_distance = distance
+            best_sample = sample_name
+            best_offset = entry_offset
+            best_samples = {sample_name} if not ambiguous else set()
+            ambiguous_at_best = ambiguous
+        elif distance == best_distance:
+            if ambiguous:
+                ambiguous_at_best = True
+            else:
+                best_samples.add(sample_name)
+
+    if not found_candidate:
+        return LOOKUP_MISS
+    if ambiguous_at_best or len(best_samples) > 1:
+        return None, None, None
+    return best_sample, best_distance, best_offset
+
+def _find_best_match_scan(observed_i7, observed_i5, r1_seq, r2_seq, sample_records, barcode_lengths, max_mismatches):
     best_match = None
     best_distance = float('inf')
     best_offset = 0
-    matches = []
-    
-    # Try both offset positions for inline barcodes (0 and 1)
-    for offset in [0, 1]:
-        obs_bc_r1 = r1_seq[offset:offset+barcode_lengths[0]] if barcode_lengths[0] > 0 and len(r1_seq) >= offset+barcode_lengths[0] else None
-        obs_bc_r2 = r2_seq[offset:offset+barcode_lengths[1]] if barcode_lengths[1] > 0 and len(r2_seq) >= offset+barcode_lengths[1] else None
-        
-        for sample_name, (exp_i7, exp_i5, exp_bc_r1, exp_bc_r2) in expected_combos.items():
+    best_samples = set()
+    use_offsets = barcode_lengths[0] > 0 or barcode_lengths[1] > 0
+    offsets = (0, 1) if use_offsets else (0,)
+
+    r1_len = len(r1_seq)
+    r2_len = len(r2_seq)
+
+    for offset in offsets:
+        obs_bc_r1 = None
+        obs_bc_r2 = None
+        if barcode_lengths[0] > 0:
+            bc_r1_end = offset + barcode_lengths[0]
+            if r1_len >= bc_r1_end:
+                obs_bc_r1 = r1_seq[offset:bc_r1_end]
+        if barcode_lengths[1] > 0:
+            bc_r2_end = offset + barcode_lengths[1]
+            if r2_len >= bc_r2_end:
+                obs_bc_r2 = r2_seq[offset:bc_r2_end]
+
+        for sample_name, (exp_i7, exp_i5, exp_bc_r1, exp_bc_r2) in sample_records:
             total_dist = 0
-            
-            # Compare header indices if provided
+
             if exp_i7 and observed_i7:
-                total_dist += hamming_distance(observed_i7, exp_i7)
+                remaining = max_mismatches - total_dist
+                total_dist += hamming_distance_bounded(observed_i7, exp_i7, remaining)
+                if total_dist > max_mismatches:
+                    continue
             if exp_i5 and observed_i5:
-                total_dist += hamming_distance(observed_i5, exp_i5)
-            
-            # Compare inline barcodes if provided
+                remaining = max_mismatches - total_dist
+                total_dist += hamming_distance_bounded(observed_i5, exp_i5, remaining)
+                if total_dist > max_mismatches:
+                    continue
             if exp_bc_r1 and obs_bc_r1:
-                total_dist += hamming_distance(obs_bc_r1, exp_bc_r1)
+                remaining = max_mismatches - total_dist
+                total_dist += hamming_distance_bounded(obs_bc_r1, exp_bc_r1, remaining)
+                if total_dist > max_mismatches:
+                    continue
             if exp_bc_r2 and obs_bc_r2:
-                total_dist += hamming_distance(obs_bc_r2, exp_bc_r2)
-            
+                remaining = max_mismatches - total_dist
+                total_dist += hamming_distance_bounded(obs_bc_r2, exp_bc_r2, remaining)
+                if total_dist > max_mismatches:
+                    continue
+
             if total_dist <= max_mismatches:
                 if total_dist < best_distance:
                     best_match = sample_name
                     best_distance = total_dist
                     best_offset = offset
-                    matches = [(sample_name, offset)]
+                    best_samples = {sample_name}
                 elif total_dist == best_distance:
-                    matches.append((sample_name, offset))
-    
-    # Check for ambiguous matches (same sample at different offsets is OK)
-    unique_samples = set([m[0] for m in matches])
-    if len(unique_samples) > 1:
+                    best_samples.add(sample_name)
+
+    if len(best_samples) > 1:
         return None, None, None
-    
     return best_match, best_distance if best_match else None, best_offset
+
+def find_best_match(observed_i7, observed_i5, r1_seq, r2_seq, expected_combos, barcode_lengths, max_mismatches,
+                    sample_records=None, fast_lookup=None, demux_mode=None):
+    """
+    Find best matching sample based on header indices and/or inline barcodes.
+    Uses a precomputed O(1) lookup for max_mismatches <= 1, with scan fallback.
+    Returns (sample_name, total_mismatches, barcode_offset) or (None, None, None).
+    """
+    if sample_records is None:
+        sample_records = list(expected_combos.items())
+    if demux_mode is None:
+        has_indices = any(v[0] and v[1] for _, v in sample_records)
+        has_barcodes = barcode_lengths[0] > 0 or barcode_lengths[1] > 0
+        if has_indices and has_barcodes:
+            demux_mode = 'both'
+        elif has_indices:
+            demux_mode = 'indices'
+        else:
+            demux_mode = 'barcodes'
+
+    if fast_lookup is not None:
+        match = _find_best_match_lookup(
+            observed_i7, observed_i5, r1_seq, r2_seq, barcode_lengths, demux_mode, fast_lookup
+        )
+        if match is not LOOKUP_MISS:
+            return match
+
+    return _find_best_match_scan(
+        observed_i7, observed_i5, r1_seq, r2_seq, sample_records, barcode_lengths, max_mismatches
+    )
 
 def format_time(seconds):
     """Format seconds into human readable time"""
@@ -200,6 +380,7 @@ def check_first_reads(r1_file, r2_file, expected_combos, barcode_lengths, demux_
     
     r1_open = gzip.open(r1_file, 'rt') if r1_file.endswith('.gz') else open(r1_file)
     r2_open = gzip.open(r2_file, 'rt') if r2_file.endswith('.gz') else open(r2_file)
+    sample_records = list(expected_combos.items())
     
     for i in range(num_reads):
         r1_lines = [r1_open.readline() for _ in range(4)]
@@ -229,7 +410,8 @@ def check_first_reads(r1_file, r2_file, expected_combos, barcode_lengths, demux_
         
         # Find closest match
         best_sample, best_dist, best_offset = find_best_match(obs_i7, obs_i5, r1_lines[1], r2_lines[1], 
-                                                               expected_combos, barcode_lengths, 999)
+                                                               expected_combos, barcode_lengths, 999,
+                                                               sample_records=sample_records, demux_mode=demux_mode)
         
         if best_sample:
             if demux_mode == 'barcodes':
@@ -251,9 +433,15 @@ def demultiplex(r1_file, r2_file, sample_file, output_prefix, max_mismatches=1,
     
     # Parse sample file and auto-detect format
     expected_combos, demux_mode, barcode_lengths = parse_sample_file(sample_file)
+    sample_records = list(expected_combos.items())
+    fast_lookup = build_fast_lookup(expected_combos, demux_mode, max_mismatches)
     
     print(f"Detected demultiplexing mode: {demux_mode}")
     print(f"Loaded {len(expected_combos)} sample combinations")
+    if fast_lookup is not None:
+        print(f"Using precomputed fast lookup for mismatch threshold {max_mismatches}")
+    else:
+        print(f"Using scan-based matching for mismatch threshold {max_mismatches}")
     print("\nSample combinations:")
     for sample, (i7, i5, bc_r1, bc_r2) in sorted(expected_combos.items()):
         parts = []
@@ -307,38 +495,44 @@ def demultiplex(r1_file, r2_file, sample_file, output_prefix, max_mismatches=1,
     print("\nProcessing reads...")
     print("-" * 50)
     
+    r1_readline = r1_open.readline
+    r2_readline = r2_open.readline
+
     while True:
-        r1_lines = [r1_open.readline() for _ in range(4)]
-        r2_lines = [r2_open.readline() for _ in range(4)]
-        
-        if not r1_lines[0]:
+        r1_h = r1_readline()
+        if not r1_h:
             break
-        
+        r1_s = r1_readline()
+        r1_p = r1_readline()
+        r1_q = r1_readline()
+        r2_h = r2_readline()
+        r2_s = r2_readline()
+        r2_p = r2_readline()
+        r2_q = r2_readline()
+
         total_reads += 1
         
         # Extract header indices
-        obs_i7, obs_i5 = parse_indices_from_header(r1_lines[0])
+        obs_i7, obs_i5 = parse_indices_from_header(r1_h)
         
         # Find best match (checks both offset positions internally)
-        sample, mismatches, offset = find_best_match(obs_i7, obs_i5, r1_lines[1], r2_lines[1],
-                                                     expected_combos, barcode_lengths, max_mismatches)
+        sample, mismatches, offset = find_best_match(
+            obs_i7, obs_i5, r1_s, r2_s, expected_combos, barcode_lengths, max_mismatches,
+            sample_records=sample_records, fast_lookup=fast_lookup, demux_mode=demux_mode
+        )
         
         if sample:
-            # Write matched reads
-            output_r1 = list(r1_lines)
-            output_r2 = list(r2_lines)
-            
             # Trim barcodes if requested (accounting for offset)
+            sample_r1 = output_handles[sample]['r1']
+            sample_r2 = output_handles[sample]['r2']
             if trim_barcodes and barcode_lengths[0] > 0:
                 trim_pos_r1 = offset + barcode_lengths[0]
                 trim_pos_r2 = offset + barcode_lengths[1]
-                output_r1[1] = r1_lines[1][trim_pos_r1:]
-                output_r1[3] = r1_lines[3][trim_pos_r1:]
-                output_r2[1] = r2_lines[1][trim_pos_r2:]
-                output_r2[3] = r2_lines[3][trim_pos_r2:]
-            
-            output_handles[sample]['r1'].writelines(output_r1)
-            output_handles[sample]['r2'].writelines(output_r2)
+                sample_r1.writelines((r1_h, r1_s[trim_pos_r1:], r1_p, r1_q[trim_pos_r1:]))
+                sample_r2.writelines((r2_h, r2_s[trim_pos_r2:], r2_p, r2_q[trim_pos_r2:]))
+            else:
+                sample_r1.writelines((r1_h, r1_s, r1_p, r1_q))
+                sample_r2.writelines((r2_h, r2_s, r2_p, r2_q))
             stats[sample] += 1
             offset_stats[offset] += 1
         else:
@@ -347,15 +541,15 @@ def demultiplex(r1_file, r2_file, sample_file, output_prefix, max_mismatches=1,
             if demux_mode in ['indices', 'both'] and obs_i7 and obs_i5:
                 combo_parts.append(f"{obs_i7}+{obs_i5}")
             if demux_mode in ['barcodes', 'both'] and barcode_lengths[0] > 0:
-                obs_bc_r1 = r1_lines[1][:barcode_lengths[0]].strip()
-                obs_bc_r2 = r2_lines[1][:barcode_lengths[1]].strip()
+                obs_bc_r1 = r1_s[:barcode_lengths[0]]
+                obs_bc_r2 = r2_s[:barcode_lengths[1]]
                 combo_parts.append(f"{obs_bc_r1}+{obs_bc_r2}")
             combo_str = "|".join(combo_parts) if combo_parts else "unknown"
             unmatched_combos[combo_str] += 1
             
             if not discard_undetermined:
-                output_handles['undetermined']['r1'].writelines(r1_lines)
-                output_handles['undetermined']['r2'].writelines(r2_lines)
+                output_handles['undetermined']['r1'].writelines((r1_h, r1_s, r1_p, r1_q))
+                output_handles['undetermined']['r2'].writelines((r2_h, r2_s, r2_p, r2_q))
             stats['undetermined'] += 1
         
         # Progress update
